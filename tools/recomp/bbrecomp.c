@@ -966,6 +966,8 @@ static int translate_extra(uint64_t off, const BbInsn *in) {
     Str a, b, w, ad;
     int stack = 0;
     switch (m) {
+    case M(RDTSC): emit("{ const uint64_t t = rc_tsc(); r[RAX] = (uint32_t)t; r[RDX] = t >> 32; }\n"); return 1;
+    case M(RDTSCP): emit("{ const uint64_t t = rc_tsc(); r[RAX] = (uint32_t)t; r[RDX] = t >> 32; r[RCX] = 0; }\n"); return 1;
     case M(CBW): emit("r[RAX] = (r[RAX] & ~0xffffull) | ((uint64_t)(int16_t)(int8_t)r[RAX] & 0xffff);\n"); return 1;
     case M(CWDE): emit("r[RAX] = (uint32_t)(int32_t)(int16_t)r[RAX];\n"); return 1;
     case M(CDQE): emit("r[RAX] = (uint64_t)(int64_t)(int32_t)r[RAX];\n"); return 1;

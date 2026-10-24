@@ -98,6 +98,26 @@ static inline int rc_cond(int cc, int kind, uint64_t a, uint64_t b, uint64_t r, 
  * other threads read and write structures on it (the game's jobs report into their creator's
  * stack), so plain accesses there let the compiler reorder or merge what another thread sees. */
 static inline uint64_t rc_ld(uint64_t address, int size) { return bb_load(address, size); }
+/* rdtsc in generated code: bbcpu_tsc() computed in place (the arm64 virtual counter scaled to
+ * BBCPU_TSC_HZ by the same reduced ratio), without the interpreter. */
+static inline uint64_t rc_tsc(void) {
+#if defined(__aarch64__)
+    static uint64_t num, den;
+    if (!__atomic_load_n(&den, __ATOMIC_ACQUIRE)) {
+        uint64_t hz;
+        __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(hz));
+        uint64_t x = BBCPU_TSC_HZ, y = hz ? hz : 24000000;
+        while (y) { const uint64_t r = x % y; x = y; y = r; }
+        num = BBCPU_TSC_HZ / x;
+        __atomic_store_n(&den, (hz ? hz : 24000000) / x, __ATOMIC_RELEASE);
+    }
+    uint64_t counter;
+    __asm__ volatile("mrs %0, cntvct_el0" : "=r"(counter));
+    return counter * num / __atomic_load_n(&den, __ATOMIC_ACQUIRE);
+#else
+    return bbcpu_tsc();
+#endif
+}
 static inline void rc_st(uint64_t address, int size, uint64_t value) { bb_store(address, size, value); }
 static inline uint64_t rc_lds(uint64_t address, int size) { return bb_load(address, size); }
 static inline void rc_sts(uint64_t address, int size, uint64_t value) { bb_store(address, size, value); }

@@ -558,6 +558,69 @@ static int translate_vector(uint64_t off, const BbInsn *in) {
         return vbinary(off, in, 4, w, 0, "rr.q[i] = a.q[i] | b.q[i];");
     case M(XORPS): case M(VXORPS): case M(XORPD): case M(VXORPD): case M(PXOR): case M(VPXOR):
         return vbinary(off, in, 4, w, 0, "rr.q[i] = a.q[i] ^ b.q[i];");
+    /* Unpacks, within each 128-bit lane: element i of the result is element i / 2 of the low
+     * (or high) half, of a for even i and of b for odd i. */
+    case M(PUNPCKLBW): case M(VPUNPCKLBW): return vbinary(off, in, w, w, 1, "rr.b[i] = (i & 1 ? b : a).b[(i & ~15) + (i & 15) / 2];");
+    case M(PUNPCKHBW): case M(VPUNPCKHBW): return vbinary(off, in, w, w, 1, "rr.b[i] = (i & 1 ? b : a).b[(i & ~15) + 8 + (i & 15) / 2];");
+    case M(PUNPCKLWD): case M(VPUNPCKLWD): return vbinary(off, in, w / 2, w, 1, "rr.w[i] = (i & 1 ? b : a).w[(i & ~7) + (i & 7) / 2];");
+    case M(PUNPCKHWD): case M(VPUNPCKHWD): return vbinary(off, in, w / 2, w, 1, "rr.w[i] = (i & 1 ? b : a).w[(i & ~7) + 4 + (i & 7) / 2];");
+    case M(PUNPCKLDQ): case M(VPUNPCKLDQ):
+        return vbinary(off, in, w / 4, w, 1, "rr.d[i] = (i & 1 ? b : a).d[(i & ~3) + (i & 3) / 2];");
+    case M(PUNPCKHDQ): case M(VPUNPCKHDQ):
+        return vbinary(off, in, w / 4, w, 1, "rr.d[i] = (i & 1 ? b : a).d[(i & ~3) + 2 + (i & 3) / 2];");
+    case M(PUNPCKLQDQ): case M(VPUNPCKLQDQ):
+        return vbinary(off, in, w / 8, w, 1, "rr.q[i] = (i & 1 ? b : a).q[i & ~1];");
+    case M(PUNPCKHQDQ): case M(VPUNPCKHQDQ):
+        return vbinary(off, in, w / 8, w, 1, "rr.q[i] = (i & 1 ? b : a).q[(i & ~1) + 1];");
+    case M(PCMPGTB): case M(VPCMPGTB): return vbinary(off, in, w, w, 1, "rr.b[i] = a.sb[i] > b.sb[i] ? 0xff : 0;");
+    case M(PCMPGTW): case M(VPCMPGTW): return vbinary(off, in, w / 2, w, 1, "rr.w[i] = a.sw[i] > b.sw[i] ? 0xffff : 0;");
+    case M(PCMPGTD): case M(VPCMPGTD): return vbinary(off, in, w / 4, w, 1, "rr.d[i] = a.sd[i] > b.sd[i] ? ~0u : 0;");
+    case M(PCMPGTQ): case M(VPCMPGTQ): return vbinary(off, in, w / 8, w, 1, "rr.q[i] = a.sq[i] > b.sq[i] ? ~0ull : 0;");
+    /* Bytes of a by b's indexes within each 128-bit lane; index bit 7: zero. */
+    case M(PSHUFB): case M(VPSHUFB):
+        return vbinary(off, in, w, w, 1, "rr.b[i] = (b.b[i] & 0x80) ? 0 : a.b[(i & ~15) + (b.b[i] & 15)];");
+    case M(MOVSHDUP): case M(VMOVSHDUP): case M(MOVSLDUP): case M(VMOVSLDUP): {
+        if (!vread(off, in, &in->op[1], &a) || !vwrite(off, in, &in->op[0], "rr", w, &s)) return 0;
+        const int odd = m == M(MOVSHDUP) || m == M(VMOVSHDUP);
+        emit("{ const BbVec a = %s; BbVec rr = a; for (int i = 0; i < %d; ++i) rr.d[i] = a.d[(i & ~1) + %d]; %s }\n",
+             a.s, w / 4, odd, s.s);
+        return 1;
+    }
+    case M(VPERMILPD): {
+        if (in->count < 3 || in->op[2].type != OP_IMM) return 0; /* the variable form: interpreted */
+        if (!vread(off, in, &in->op[1], &a) || !vwrite(off, in, &in->op[0], "rr", w, &s)) return 0;
+        emit("{ const BbVec a = %s; BbVec rr = a; for (int i = 0; i < %d; ++i) rr.q[i] = a.q[(i & ~1) + ((%dll >> i) & 1)]; %s }\n",
+             a.s, w / 8, (int)in->op[2].disp, s.s);
+        return 1;
+    }
+    /* The low (or high) quadword from memory into a register, or from a register to memory. */
+    case M(MOVLPS): case M(VMOVLPS): case M(MOVLPD): case M(VMOVLPD): case M(MOVHPS): case M(VMOVHPS):
+    case M(MOVHPD): case M(VMOVHPD): {
+        const int high = m == M(MOVHPS) || m == M(VMOVHPS) || m == M(MOVHPD) || m == M(VMOVHPD);
+        const BbOp *d = &in->op[0];
+        Str ad;
+        int stack;
+        if (d->type == OP_MEM) {
+            if (!vread(off, in, &in->op[1], &a) || !address(off, in, d, &ad, &stack)) return 0;
+            emit("{ const BbVec a = %s; rc_st(%s, 8, a.q[%d]); }\n", a.s, ad.s, high);
+            return 1;
+        }
+        if (!vreg(d) || !vread(off, in, in->count == 3 ? &in->op[1] : d, &a) ||
+            !address(off, in, &in->op[in->count - 1], &ad, &stack) || !vwrite(off, in, d, "rr", 16, &s)) return 0;
+        emit("{ BbVec rr = %s; rr.q[%d] = rc_ld(%s, 8); %s }\n", a.s, high, ad.s, s.s);
+        return 1;
+    }
+    /* Scalar round by imm (bit 2: MXCSR.RC), as the interpreter (round_mode). */
+    case M(ROUNDSS): case M(VROUNDSS): case M(ROUNDSD): case M(VROUNDSD): {
+        const VOps o = vops3(in);
+        if (!o.imm || !vread(off, in, o.s1, &a) || !vread(off, in, o.s2, &b) || !vwrite(off, in, o.dst, "rr", 16, &s)) return 0;
+        const int imm = (int)o.imm->disp, dbl = m == M(ROUNDSD) || m == M(VROUNDSD);
+        const char *mode = (imm & 4) ? "(int)((c->mxcsr >> 13) & 3)" : (imm & 3) == 0 ? "0" : (imm & 3) == 1 ? "1" : (imm & 3) == 2 ? "2" : "3";
+        emit("{ BbVec rr = %s; const BbVec b = %s; const double x = %s; const int mode = %s; "
+             "const double y = mode == 0 ? __builtin_nearbyint(x) : mode == 1 ? __builtin_floor(x) : mode == 2 ? __builtin_ceil(x) : __builtin_trunc(x); "
+             "%s %s }\n", a.s, b.s, dbl ? "b.fd[0]" : "(double)b.f[0]", mode, dbl ? "rr.fd[0] = y;" : "rr.f[0] = (float)y;", s.s);
+        return 1;
+    }
     case M(PADDD): case M(VPADDD): return vbinary(off, in, w / 4, w, 1, "rr.d[i] = a.d[i] + b.d[i];");
     case M(PSUBD): case M(VPSUBD): return vbinary(off, in, w / 4, w, 1, "rr.d[i] = a.d[i] - b.d[i];");
     case M(PADDQ): case M(VPADDQ): return vbinary(off, in, w / 8, w, 1, "rr.q[i] = a.q[i] + b.q[i];");

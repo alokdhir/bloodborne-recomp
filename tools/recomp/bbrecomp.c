@@ -621,6 +621,28 @@ static int translate_vector(uint64_t off, const BbInsn *in) {
              "%s %s }\n", a.s, b.s, dbl ? "b.fd[0]" : "(double)b.f[0]", mode, dbl ? "rr.fd[0] = y;" : "rr.f[0] = (float)y;", s.s);
         return 1;
     }
+    /* SSE4A, as the interpreter: a bit field of the low quadword; the upper quadword zeroed. */
+    case M(EXTRQ): case M(INSERTQ): {
+        const BbOp *d0 = &in->op[0];
+        if (!vreg(d0) || !vread(off, in, d0, &a) || !vwrite(off, in, d0, "dd", 16, &s)) return 0;
+        Str ctl;
+        if (m == M(EXTRQ) && in->op[1].type == OP_IMM) {
+            ctl = str("%lluull", (unsigned long long)((in->op[1].disp & 63) | (in->op[2].disp & 63) << 8));
+            b = str("dd");
+        } else {
+            if (!vread(off, in, &in->op[1], &b)) return 0;
+            if (m == M(EXTRQ)) ctl = str("sv.q[0]");
+            else if (in->count > 2 && in->op[2].type == OP_IMM)
+                ctl = str("%lluull", (unsigned long long)((in->op[2].disp & 63) | (in->op[3].disp & 63) << 8));
+            else ctl = str("sv.q[1]");
+        }
+        emit("{ BbVec dd = %s; const BbVec sv = %s; const uint64_t ctl = %s; const unsigned length = ctl & 63, index = ctl >> 8 & 63; "
+             "const uint64_t mask = length == 0 ? ~0ull : (1ull << length) - 1; ", a.s, b.s, ctl.s);
+        if (m == M(EXTRQ)) emit("dd.q[0] = dd.q[0] >> index & mask; ");
+        else emit("const uint64_t field = mask << index; dd.q[0] = (dd.q[0] & ~field) | (sv.q[0] << index & field); ");
+        emit("dd.q[1] = 0; %s }\n", s.s);
+        return 1;
+    }
     case M(PADDD): case M(VPADDD): return vbinary(off, in, w / 4, w, 1, "rr.d[i] = a.d[i] + b.d[i];");
     case M(PSUBD): case M(VPSUBD): return vbinary(off, in, w / 4, w, 1, "rr.d[i] = a.d[i] - b.d[i];");
     case M(PADDQ): case M(VPADDQ): return vbinary(off, in, w / 8, w, 1, "rr.q[i] = a.q[i] + b.q[i];");
@@ -971,6 +993,60 @@ static int translate_extra(uint64_t off, const BbInsn *in) {
             emit("%s", w.s);
         }
         emit(" }\n");
+        return 1;
+    }
+    /* popcnt, lzcnt, tzcnt, bextr: the result and the flags as the interpreter (bit_scan, bmi). */
+    case M(POPCNT): case M(LZCNT): case M(TZCNT): {
+        const int size = d->size, bits = size * 8;
+        if (!gpr(d) || !read_op(off, in, src, size, &a)) return 0;
+        const uint64_t mask = size == 8 ? ~0ull : (1ull << bits) - 1;
+        emit("{ const uint64_t a = (%s) & 0x%llxull; ", a.s, (unsigned long long)mask);
+        if (m == M(POPCNT))
+            emit("const uint64_t v = (uint64_t)__builtin_popcountll(a); "
+                 "c->flags = (rc_flags(fk, fa, fb, fr, fz, fcf, c->flags) & ~(uint64_t)F_ARITH) | (a ? 0 : F_ZF); fk = FK_CPU; ");
+        else
+            emit("const uint64_t v = !a ? %dull : %s; "
+                 "c->flags = (rc_flags(fk, fa, fb, fr, fz, fcf, c->flags) & ~(uint64_t)(F_CF | F_ZF)) | (a ? 0 : F_CF) | (v ? 0 : F_ZF); fk = FK_CPU; ",
+                 bits, m == M(TZCNT) ? "(uint64_t)__builtin_ctzll(a)" : str("(uint64_t)(__builtin_clzll(a) - %d)", 64 - bits).s);
+        if (!write_op(off, in, d, "v", &w)) return 0;
+        emit("%s }\n", w.s);
+        return 1;
+    }
+    case M(BEXTR): {
+        const int size = d->size;
+        if (!gpr(d) || in->count < 3 || !read_op(off, in, src, size, &a) || !read_op(off, in, &in->op[2], size, &b)) return 0;
+        const uint64_t mask = size == 8 ? ~0ull : (1ull << (size * 8)) - 1;
+        emit("{ const uint64_t src = %s, ctl = %s; const unsigned start = ctl & 0xff, len = (ctl >> 8) & 0xff; "
+             "uint64_t v = start >= %du ? 0 : src >> start; if (len < 64) v &= (1ull << len) - 1; v &= 0x%llxull; "
+             "c->flags = (rc_flags(fk, fa, fb, fr, fz, fcf, c->flags) & ~(uint64_t)F_ARITH) | (v ? 0 : F_ZF) | ((v >> %d) & 1 ? F_SF : 0); fk = FK_CPU; ",
+             a.s, b.s, size * 8, (unsigned long long)mask, size * 8 - 1);
+        if (!write_op(off, in, d, "v", &w)) return 0;
+        emit("%s }\n", w.s);
+        return 1;
+    }
+    /* div, idiv (32 and 64 bits): flags unchanged, as the interpreter; division by zero and
+     * overflow go to the interpreter (its fault). */
+    case M(DIV): case M(IDIV): {
+        const int size = d->size;
+        if ((size != 4 && size != 8) || !read_op(off, in, d, size, &a)) return 0;
+        const char *sgn = m == M(IDIV) ? "" : "unsigned ";
+        emit("{ const uint64_t dv = %s; ", a.s);
+        if (m == M(DIV)) {
+            if (size == 4) emit("const unsigned __int128 n = ((uint64_t)(uint32_t)r[RDX] << 32) | (uint32_t)r[RAX]; const unsigned __int128 q = dv ? n / (uint32_t)dv : 0, rm = dv ? n %% (uint32_t)dv : 0; const int bad = !dv || q > 0xffffffffull; ");
+            else emit("const unsigned __int128 n = ((unsigned __int128)r[RDX] << 64) | r[RAX]; const unsigned __int128 q = dv ? n / dv : 0, rm = dv ? n %% dv : 0; const int bad = !dv || q > ~0ull; ");
+        } else {
+            if (size == 4) emit("const int64_t n = (int64_t)(((uint64_t)(uint32_t)r[RDX] << 32) | (uint32_t)r[RAX]); const int64_t dd = (int32_t)dv; "
+                               "const int bad = !dd || (n == INT64_MIN && dd == -1); const int64_t q = bad ? 0 : n / dd, rm = bad ? 0 : n %% dd; const int bad2 = bad || q != (int32_t)q; ");
+            else emit("const __int128 n = (__int128)(((unsigned __int128)r[RDX] << 64) | r[RAX]); const int64_t dd = (int64_t)dv; "
+                      "const int bad = !dd; const __int128 q = bad ? 0 : n / dd, rm = bad ? 0 : n %% dd; const int bad2 = bad || q != (int64_t)q; ");
+        }
+        (void)sgn;
+        const char *badv = m == M(DIV) ? "bad" : "bad2";
+        emit("if (%s) { " SPILL " " FLAGS_OUT " c->rip = B + 0x%" PRIx64 "ull; const uint64_t nx = rc->step(c); " RELOAD
+             " if (nx != B + 0x%" PRIx64 "ull) { dn = nx; goto L_dispatch; } } else { ", badv, off, off + in->length);
+        if (size == 4) emit("r[RAX] = (uint32_t)q; r[RDX] = (uint32_t)rm; ");
+        else emit("r[RAX] = (uint64_t)q; r[RDX] = (uint64_t)rm; ");
+        emit("} }\n");
         return 1;
     }
     case M(BT): case M(BTS): case M(BTR): case M(BTC): {
